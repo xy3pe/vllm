@@ -35,6 +35,12 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._handlers: CpuGpuOffloadingHandlers | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        self.offload_strategy: str = self.extra_config.get(
+            "offload_strategy", "proactive"
+        )
+        # eviction strategy: 1:1 block mapping (individual blocks evicted)
+        if self.offload_strategy == "eviction":
+            self.offloaded_block_size = self.gpu_block_size
 
     def get_manager(self) -> OffloadingManager:
         if not self._manager:

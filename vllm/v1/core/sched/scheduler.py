@@ -787,8 +787,17 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
-        # Auto-swap: offload evicted blocks to CPU before forward pass
-        if self.release_offloading_manager is not None:
+        # Offload evicted blocks to CPU before forward pass.
+        # Connector-based eviction takes priority over standalone auto-swap.
+        if self.connector is not None:
+            evictions = self.kv_cache_manager.take_pending_evictions()
+            if evictions:
+                from vllm.v1.core.kv_cache_utils import get_block_hash
+                converted = [
+                    (bid, get_block_hash(bh)) for bid, bh in evictions
+                ]
+                self.connector.notify_evictions(converted)
+        elif self.release_offloading_manager is not None:
             self._process_evicted_blocks_for_swap()
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):

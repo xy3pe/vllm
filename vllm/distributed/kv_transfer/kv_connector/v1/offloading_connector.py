@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    eviction_stores: list[TransferSpec]
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -132,6 +133,13 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def notify_evictions(
+        self,
+        evictions: list[tuple[int, BlockHash]],
+    ):
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.notify_evictions(evictions)
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
@@ -145,6 +153,9 @@ class OffloadingConnectorScheduler:
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
         self.manager: OffloadingManager = spec.get_manager()
+        self.offload_strategy: str = getattr(
+            spec, "offload_strategy", "proactive"
+        )
 
         self._requests: dict[ReqId, Request] = {}
         # list of GPU block IDs per request
@@ -158,6 +169,9 @@ class OffloadingConnectorScheduler:
         # request ID -> set(block hashes being stored/load)
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
+
+        # eviction strategy: pending stores from evicted blocks
+        self._pending_eviction_stores: list[TransferSpec] = []
 
     def _get_block_hashes(
         self,
@@ -266,7 +280,52 @@ class OffloadingConnectorScheduler:
         self._reqs_being_loaded[request.request_id].update(block_hashes)
         self._next_stored_block_idx[request.request_id] = num_blocks
 
+    def notify_evictions(
+        self,
+        evictions: list[tuple[int, BlockHash]],
+    ):
+        """Process blocks evicted from prefix cache for CPU offloading.
+
+        Called by scheduler after schedule(). Only active when
+        offload_strategy == "eviction".
+
+        Args:
+            evictions: list of (gpu_block_id, block_hash) of evicted blocks.
+        """
+        if not evictions or self.offload_strategy != "eviction":
+            return
+
+        gpu_block_ids = [block_id for block_id, _ in evictions]
+        block_hashes = [bh for _, bh in evictions]
+
+        store_output = self.manager.prepare_store(block_hashes)
+        if store_output is None or not store_output.block_hashes_to_store:
+            return
+
+        # Map stored hashes back to GPU block IDs
+        hash_to_gpu_id = dict(zip(block_hashes, gpu_block_ids))
+        src_block_ids = [
+            hash_to_gpu_id[h]
+            for h in store_output.block_hashes_to_store
+        ]
+
+        src_spec = GPULoadStoreSpec(src_block_ids)
+        dst_spec = store_output.store_spec
+        self._pending_eviction_stores.append((src_spec, dst_spec))
+
+        # Mark as complete immediately (sync transfer will happen
+        # before execute_model in start_load_kv)
+        self.manager.complete_store(store_output.block_hashes_to_store)
+
+        logger.info(
+            "Eviction offload: queued %d blocks for CPU store",
+            len(src_block_ids),
+        )
+
     def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
+        if self.offload_strategy == "eviction":
+            return {}  # eviction strategy: no proactive stores
+
         reqs_to_store: dict[ReqId, TransferSpec] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
@@ -343,8 +402,10 @@ class OffloadingConnectorScheduler:
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            eviction_stores=self._pending_eviction_stores,
         )
         self._reqs_to_load = {}
+        self._pending_eviction_stores = []
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -461,6 +522,28 @@ class OffloadingConnectorWorker:
         self._register_handlers(kv_caches, attn_backends)
 
     def start_load_kv(self, metadata: OffloadingConnectorMetadata):
+        # Process eviction stores first (must complete before execute_model
+        # overwrites the evicted blocks)
+        if metadata.eviction_stores:
+            eviction_job_ids: set[int] = set()
+            for transfer_spec in metadata.eviction_stores:
+                job_id = self._generate_job_id()
+                assert self.worker.transfer_async(job_id, transfer_spec)
+                eviction_job_ids.add(job_id)
+
+            # Wait for all eviction stores to complete. These are not
+            # tracked in _jobs since they aren't tied to any request.
+            while eviction_job_ids:
+                for finished_id, success in self.worker.get_finished():
+                    assert success
+                    eviction_job_ids.discard(finished_id)
+
+            logger.debug(
+                "Completed %d eviction stores before execute_model",
+                len(metadata.eviction_stores),
+            )
+
+        # Then process normal loads (async)
         for req_id, transfer_spec in metadata.reqs_to_load.items():
             job_id = self._generate_job_id()
             self._jobs[job_id] = (req_id, False)

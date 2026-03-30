@@ -514,6 +514,24 @@ class KVConnectorBase_V1(ABC):
         """
         return ()
 
+    def notify_evictions(
+        self,
+        evictions: list[tuple[int, Any]],
+    ):
+        """
+        Notify connector of blocks evicted from prefix cache.
+
+        Called by the scheduler after schedule() with evicted block info.
+        Default is a no-op. Override in connectors that support
+        eviction-triggered offloading.
+
+        Args:
+            evictions: list of (gpu_block_id, block_hash) tuples
+                for blocks that were just evicted. The block data is
+                still valid in GPU memory until execute_model() runs.
+        """
+        return
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """
