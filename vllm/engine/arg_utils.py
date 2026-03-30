@@ -571,6 +571,8 @@ class EngineArgs:
     kv_offloading_backend: KVOffloadingBackend | None = (
         CacheConfig.kv_offloading_backend
     )
+    num_release_cpu_blocks: int | None = CacheConfig.num_release_cpu_blocks
+    release_offload_checksum: bool = CacheConfig.release_offload_checksum
     tokens_only: bool = False
 
     def __post_init__(self):
@@ -925,6 +927,14 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--num-release-cpu-blocks",
+            **cache_kwargs["num_release_cpu_blocks"],
+        )
+        cache_group.add_argument(
+            "--release-offload-checksum",
+            **cache_kwargs["release_offload_checksum"],
         )
 
         # Multimodal related configs
@@ -1375,6 +1385,8 @@ class EngineArgs:
             mamba_block_size=self.mamba_block_size,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            num_release_cpu_blocks=self.num_release_cpu_blocks,
+            release_offload_checksum=self.release_offload_checksum,
         )
 
         ray_runtime_env = None

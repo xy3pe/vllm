@@ -185,9 +185,26 @@ class SchedulerInterface(ABC):
         """Shutdown the scheduler."""
         raise NotImplementedError
 
+    # Release offloading manager (None if CPU offloading not configured)
+    release_offloading_manager = None
+
     def release_kv_cache(self, session_id: str,
                          block_hashes: list) -> int:
         raise NotImplementedError
+
+    def take_pending_release_transfers(
+        self,
+    ) -> list[tuple[list[int], list[int], list]]:
+        return []
+
+    def lookup_cpu_cache_for_request(
+        self, block_hashes: list
+    ) -> tuple[int, list[int] | None]:
+        return 0, None
+
+    def get_release_cache_stats(self) -> dict[str, int]:
+        """Return block pool statistics as a dict."""
+        return {}
 
     def get_kv_connector(self) -> Optional["KVConnectorBase_V1"]:
         return None

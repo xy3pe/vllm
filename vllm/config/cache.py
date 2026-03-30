@@ -159,6 +159,17 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache' This option must be used
     together with kv_offloading_size."""
 
+    num_release_cpu_blocks: int | None = None
+    """Number of CPU blocks to allocate for KV cache release offloading.
+    When set, released KV cache blocks (via /release_kv_cache API) will be
+    copied to CPU pinned memory, allowing later restoration when a new request
+    hits the same prefix. If None, release offloading is disabled."""
+
+    release_offload_checksum: bool = False
+    """When enabled, compute and log tensor checksums during KV cache
+    offload (GPU/NPU→CPU) and restore (CPU→GPU/NPU) to verify data
+    integrity. Useful for debugging; has performance overhead."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -186,6 +197,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # CPU offloading for release doesn't affect graph shape
+            "num_release_cpu_blocks",
+            "release_offload_checksum",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

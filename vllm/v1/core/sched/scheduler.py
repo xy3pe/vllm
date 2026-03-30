@@ -213,6 +213,32 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # Release KV cache offloading to CPU.
+        self.release_offloading_manager = None
+        self._block_access_count = 0
+        self._npu_hit_count = 0
+        self._cpu_hit_count = 0
+        self._pending_release_transfers: list[
+            tuple[list[int], list[int], list]
+        ] = []
+        num_release_cpu_blocks = self.cache_config.num_release_cpu_blocks
+        if num_release_cpu_blocks is not None and num_release_cpu_blocks > 0:
+            from vllm.v1.kv_offload.backends.cpu import CPUBackend
+            from vllm.v1.kv_offload.lru_manager import LRUOffloadingManager
+
+            cpu_backend = CPUBackend(
+                block_size=self.block_size,
+                num_blocks=num_release_cpu_blocks,
+            )
+            self.release_offloading_manager = LRUOffloadingManager(
+                backend=cpu_backend,
+            )
+            logger.info(
+                "Release offloading manager initialized with %d "
+                "CPU blocks",
+                num_release_cpu_blocks,
+            )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -503,6 +529,15 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
+
+                    # Track block-level hit stats.
+                    total_blocks = len(request.block_hashes)
+                    if total_blocks > 0:
+                        npu_hit_blocks = (
+                            num_new_local_computed_tokens // self.block_size
+                        )
+                        self._block_access_count += total_blocks
+                        self._npu_hit_count += npu_hit_blocks
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -751,6 +786,10 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+
+        # Auto-swap: offload evicted blocks to CPU before forward pass
+        if self.release_offloading_manager is not None:
+            self._process_evicted_blocks_for_swap()
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1155,6 +1194,14 @@ class Scheduler(SchedulerInterface):
                 else:
                     stopped_preempted_reqs.add(request)
 
+                if self.release_offloading_manager is not None:
+                    stats = self.get_release_cache_stats()
+                    if stats:
+                        logger.info(
+                            "Request %s finished. cache stats: %s",
+                            req_id, stats,
+                        )
+
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
@@ -1529,9 +1576,186 @@ class Scheduler(SchedulerInterface):
 
     def release_kv_cache(self, session_id: str,
                          block_hashes: list) -> int:
-        return self.kv_cache_manager.release_kv_cache(
+        logger.info(
+            "release_kv_cache called: session_id=%s, "
+            "num_block_hashes=%d, offloading_manager=%s",
+            session_id, len(block_hashes),
+            self.release_offloading_manager is not None,
+        )
+
+        # 1. Existing aging logic
+        aged = self.kv_cache_manager.release_kv_cache(
             session_id, block_hashes
         )
+        logger.info("release_kv_cache aged %d blocks", aged)
+
+        # 2. Offload released blocks to CPU if configured
+        if self.release_offloading_manager is not None and aged > 0:
+            store_output = self.release_offloading_manager.prepare_store(
+                block_hashes
+            )
+            logger.info(
+                "prepare_store returned: has_output=%s, "
+                "hashes_to_store=%d",
+                store_output is not None,
+                len(store_output.block_hashes_to_store)
+                if store_output is not None
+                and store_output.block_hashes_to_store
+                else 0,
+            )
+            if store_output is not None and store_output.block_hashes_to_store:
+                # Resolve block hashes to GPU block IDs
+                gpu_block_ids = (
+                    self.kv_cache_manager.get_gpu_block_ids_for_hashes(
+                        store_output.block_hashes_to_store
+                    )
+                )
+                logger.info(
+                    "Resolved %d GPU block IDs for %d hashes",
+                    len(gpu_block_ids),
+                    len(store_output.block_hashes_to_store),
+                )
+                if gpu_block_ids:
+                    from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+                    cpu_spec = store_output.store_spec
+                    assert isinstance(cpu_spec, CPULoadStoreSpec)
+                    cpu_block_ids = cpu_spec.block_ids.tolist()
+                    self._pending_release_transfers.append(
+                        (gpu_block_ids, cpu_block_ids,
+                         store_output.block_hashes_to_store)
+                    )
+                    self.release_offloading_manager.complete_store(
+                        store_output.block_hashes_to_store
+                    )
+        return aged
+
+    def _process_evicted_blocks_for_swap(self) -> None:
+        """Process blocks evicted during this scheduling step.
+
+        Evicted blocks still have valid data in GPU/NPU memory (forward pass
+        has not run yet). We offload them to CPU via the same
+        release_offloading_manager used by release_kv_cache.
+        """
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+
+        evictions = self.kv_cache_manager.take_pending_evictions()
+        if not evictions:
+            return
+
+        # Extract BlockHash (strip group_id) and gpu_block_ids
+        gpu_block_ids = [block_id for block_id, _ in evictions]
+        block_hashes = [get_block_hash(bh) for _, bh in evictions]
+
+        store_output = self.release_offloading_manager.prepare_store(
+            block_hashes
+        )
+        if store_output is None or not store_output.block_hashes_to_store:
+            return
+
+        # Map stored hashes back to their GPU block IDs
+        hash_to_gpu_id = dict(zip(block_hashes, gpu_block_ids))
+        stored_gpu_ids = [
+            hash_to_gpu_id[h]
+            for h in store_output.block_hashes_to_store
+            if h in hash_to_gpu_id
+        ]
+
+        if stored_gpu_ids:
+            from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+            cpu_spec = store_output.store_spec
+            assert isinstance(cpu_spec, CPULoadStoreSpec)
+            cpu_block_ids = cpu_spec.block_ids.tolist()
+            self._pending_release_transfers.append(
+                (stored_gpu_ids, cpu_block_ids,
+                 store_output.block_hashes_to_store)
+            )
+            self.release_offloading_manager.complete_store(
+                store_output.block_hashes_to_store
+            )
+            logger.info(
+                "Auto-swap: queued %d evicted blocks for CPU offload",
+                len(stored_gpu_ids),
+            )
+
+    def take_pending_release_transfers(
+        self,
+    ) -> list[tuple[list[int], list[int], list]]:
+        transfers = self._pending_release_transfers
+        self._pending_release_transfers = []
+        return transfers
+
+    def lookup_cpu_cache_for_request(
+        self, block_hashes: list
+    ) -> tuple[int, list[int] | None]:
+        """Check if released blocks for the given prefix exist in CPU cache.
+
+        Args:
+            block_hashes: The block hashes of the request prefix.
+
+        Returns:
+            Tuple of (num_cpu_hit_tokens, cpu_block_ids).
+            cpu_block_ids is None if no hit.
+        """
+        if self.release_offloading_manager is None:
+            return 0, None
+
+        num_hits = self.release_offloading_manager.lookup(block_hashes)
+        if num_hits == 0:
+            return 0, None
+
+        hit_hashes = block_hashes[:num_hits]
+        load_spec = self.release_offloading_manager.prepare_load(hit_hashes)
+
+        from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+        assert isinstance(load_spec, CPULoadStoreSpec)
+        cpu_block_ids = load_spec.block_ids.tolist()
+
+        # Complete the load immediately (release the ref_cnt)
+        self.release_offloading_manager.complete_load(hit_hashes)
+        # Touch to update LRU
+        self.release_offloading_manager.touch(hit_hashes)
+
+        # Track CPU hit stats.
+        self._cpu_hit_count += num_hits
+
+        num_cpu_hit_tokens = num_hits * self.block_size
+        return num_cpu_hit_tokens, cpu_block_ids
+
+    def get_release_cache_stats(self) -> dict[str, int]:
+        """Return block pool statistics as a dict."""
+        mgr = self.kv_cache_manager
+        if not mgr.coordinator.single_type_managers:
+            return {}
+
+        pool = mgr.coordinator.single_type_managers[0].block_pool
+        total = pool.num_gpu_blocks
+        free = pool.get_num_free_blocks()
+        cached = len(pool.cached_block_hash_to_block)
+        allocated = total - free
+        cpu_stored = (
+            len(self.release_offloading_manager.blocks)
+            if self.release_offloading_manager is not None
+            else 0
+        )
+        total_access = self._block_access_count
+        npu_hit_rate = (
+            self._npu_hit_count / total_access if total_access > 0 else 0.0
+        )
+        cpu_hit_rate = (
+            self._cpu_hit_count / total_access if total_access > 0 else 0.0
+        )
+        return {
+            "npu_total": total,
+            "npu_allocated": allocated,
+            "npu_free": free,
+            "npu_cached": cached,
+            "cpu_stored": cpu_stored,
+            "npu_hit_rate": round(npu_hit_rate, 4),
+            "cpu_hit_rate": round(cpu_hit_rate, 4),
+            "block_accesses": total_access,
+        }
 
     def shutdown(self) -> None:
         if self.kv_event_publisher:

@@ -314,6 +314,15 @@ class EngineCore:
             req = Request.from_engine_core_request(
                 request, self.request_block_hasher
             )
+            logger.info(
+                "release_kv_cache: request_id=%s, num_tokens=%d, "
+                "num_block_hashes=%d, release_index=%d, "
+                "has_block_hasher=%s, cache_salt=%s",
+                req.request_id, req.num_tokens,
+                len(req.block_hashes), release_index,
+                self.request_block_hasher is not None,
+                req.cache_salt,
+            )
             if not req.all_token_ids:
                 release_block_index = 0
             else:
@@ -324,6 +333,25 @@ class EngineCore:
             released_blocks += self.scheduler.release_kv_cache(
                 session_id, req.block_hashes[release_block_index:]
             )
+
+        # Execute GPU→CPU offload transfers if any were queued
+        pending_transfers = (
+            self.scheduler.take_pending_release_transfers()
+        )
+        if pending_transfers:
+            self.model_executor.collective_rpc(
+                "offload_release_blocks",
+                args=(pending_transfers,),
+            )
+            logger.info(
+                "Offloaded %d transfer batches to CPU",
+                len(pending_transfers),
+            )
+
+        stats = self.scheduler.get_release_cache_stats()
+        if stats:
+            logger.info("Release cache stats: %s", stats)
+
         return released_blocks
 
     def add_request(self, request: Request, request_wave: int = 0):
@@ -357,7 +385,123 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        # Try to restore from CPU cache if we have CPU-offloaded blocks
+        # (from release_kv_cache or auto-swap on eviction).
+        if (
+            self.scheduler.release_offloading_manager is not None
+            and request.block_hashes
+        ):
+            # Count all block_hashes as accesses
+            self.scheduler._block_access_count += len(request.block_hashes)
+            self._try_restore_from_cpu_cache(request)
+
         self.scheduler.add_request(request)
+
+    def _try_restore_from_cpu_cache(self, request: Request) -> None:
+        """Try to restore KV cache blocks from CPU for a request.
+
+        First checks which blocks are still present in NPU prefix cache
+        (e.g. aged but not yet evicted). Only blocks that have been
+        evicted from NPU are actually restored from CPU via swap.
+        """
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+        num_cpu_hit_tokens, cpu_block_ids = (
+            self.scheduler.lookup_cpu_cache_for_request(
+                request.block_hashes
+            )
+        )
+        if num_cpu_hit_tokens == 0 or cpu_block_ids is None:
+            return
+
+        num_cpu_hit_blocks = len(cpu_block_ids)
+
+        # Get the first single_type_manager (handles the main KV cache)
+        manager = (
+            self.scheduler.kv_cache_manager.coordinator
+            .single_type_managers[0]
+        )
+        block_pool = manager.block_pool
+
+        # Check which blocks are still in NPU prefix cache (aged but
+        # not evicted). Only blocks missing from NPU need CPU→NPU swap.
+        hit_hashes = request.block_hashes[:num_cpu_hit_blocks]
+        npu_hit_count = 0
+        need_restore_indices = []  # indices into hit_hashes/cpu_block_ids
+        for i, block_hash in enumerate(hit_hashes):
+            cached = block_pool.get_cached_block(
+                block_hash, [manager.kv_cache_group_id]
+            )
+            if cached:
+                npu_hit_count += 1
+            else:
+                need_restore_indices.append(i)
+
+        # Update hit counters
+        self.scheduler._npu_hit_count += npu_hit_count
+        self.scheduler._cpu_hit_count += len(need_restore_indices)
+
+        logger.info(
+            "CPU cache hit: %d blocks (%d tokens) for request %s, "
+            "NPU cache still holds %d blocks, need restore %d blocks",
+            num_cpu_hit_blocks, num_cpu_hit_tokens,
+            request.request_id,
+            npu_hit_count, len(need_restore_indices),
+        )
+
+        if not need_restore_indices:
+            # All blocks still in NPU, no CPU→NPU swap needed
+            return
+
+        # Filter to only the blocks that need restoration
+        restore_cpu_ids = [cpu_block_ids[i] for i in need_restore_indices]
+        restore_hashes = [hit_hashes[i] for i in need_restore_indices]
+        num_restore = len(restore_cpu_ids)
+
+        # Check if we have enough free GPU blocks
+        if block_pool.get_num_free_blocks() < num_restore:
+            logger.warning(
+                "Not enough GPU blocks to restore %d blocks from CPU",
+                num_restore,
+            )
+            return
+
+        # Allocate GPU blocks
+        gpu_blocks = block_pool.get_new_blocks(num_restore)
+        gpu_block_ids = [blk.block_id for blk in gpu_blocks]
+
+        # Execute CPU→GPU transfer synchronously
+        transfer_specs = [(restore_cpu_ids, gpu_block_ids)]
+        self.model_executor.collective_rpc(
+            "load_release_blocks",
+            args=(transfer_specs,),
+        )
+
+        # Register the restored blocks in the GPU prefix cache
+        for blk, block_hash in zip(gpu_blocks, restore_hashes):
+            block_hash_with_gid = make_block_hash_with_group_id(
+                block_hash, manager.kv_cache_group_id
+            )
+            blk.block_hash = block_hash_with_gid
+            block_pool.cached_block_hash_to_block.insert(
+                block_hash_with_gid, blk
+            )
+
+        # Put blocks back in free queue as cached eviction candidates.
+        # free_blocks decrements ref_cnt and appends blocks with
+        # ref_cnt==0 to the free queue. Since get_new_blocks set
+        # ref_cnt=1, free_blocks will bring it to 0 and enqueue them.
+        # Reverse order so tail blocks are evicted first.
+        block_pool.free_blocks(reversed(gpu_blocks))
+
+        logger.info(
+            "Restored %d blocks from CPU to NPU for request %s",
+            num_restore, request.request_id,
+        )
+
+        stats = self.scheduler.get_release_cache_stats()
+        if stats:
+            logger.info("Restore cache stats: %s", stats)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -405,6 +549,17 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        # Auto-swap: offload evicted blocks to CPU before forward pass
+        # overwrites them. Block data is still valid at this point.
+        pending_swaps = self.scheduler.take_pending_release_transfers()
+        if pending_swaps:
+            self.model_executor.collective_rpc(
+                "offload_release_blocks", args=(pending_swaps,))
+            logger.info(
+                "Auto-swap offloaded %d transfer batches to CPU",
+                len(pending_swaps))
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -459,6 +614,16 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+
+            # Auto-swap: offload evicted blocks before forward pass
+            pending_swaps = self.scheduler.take_pending_release_transfers()
+            if pending_swaps:
+                self.model_executor.collective_rpc(
+                    "offload_release_blocks", args=(pending_swaps,))
+                logger.info(
+                    "Auto-swap offloaded %d transfer batches to CPU",
+                    len(pending_swaps))
+
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )

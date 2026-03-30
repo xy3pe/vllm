@@ -518,7 +518,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
 
 @router.post(
-    "/release_kv_cache",
+    "/v1/release_kv_cache",
     dependencies=[Depends(validate_json_request)],
     responses={
         HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},

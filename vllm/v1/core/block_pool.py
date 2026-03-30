@@ -177,6 +177,12 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        # Records blocks evicted from prefix cache for auto-swap offload.
+        # Each entry is (gpu_block_id, block_hash_with_group_id).
+        self._pending_evictions: list[
+            tuple[int, BlockHashWithGroupId]
+        ] = []
+
         self.metrics_collector = metrics_collector
 
     def get_cached_block(
@@ -348,6 +354,9 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        # Record eviction for auto-swap offload (data still valid in GPU)
+        self._pending_evictions.append((block.block_id, block_hash))
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -362,6 +371,18 @@ class BlockPool:
                 )
             )
         return True
+
+    def take_pending_evictions(
+        self,
+    ) -> list[tuple[int, BlockHashWithGroupId]]:
+        """Return and clear the list of evicted blocks for auto-swap.
+
+        Returns:
+            List of (gpu_block_id, block_hash_with_group_id) tuples.
+        """
+        evictions = self._pending_evictions
+        self._pending_evictions = []
+        return evictions
 
     def touch(self, blocks: tuple[Sequence[KVCacheBlock], ...]) -> None:
         """Touch a block increases its reference count by 1, and may remove

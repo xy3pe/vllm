@@ -150,6 +150,30 @@ class KVCacheCoordinator(ABC):
             num += manager.aging_block(session_id, block_hashes)
         return num
 
+    def get_gpu_block_ids_for_hashes(
+        self, block_hashes: list
+    ) -> list[int]:
+        """Resolve block hashes to GPU block IDs using the first manager."""
+        if not self.single_type_managers:
+            return []
+        manager = self.single_type_managers[0]
+        gpu_block_ids = []
+        for block_hash in block_hashes:
+            cached = manager.block_pool.get_cached_block(
+                block_hash, [manager.kv_cache_group_id]
+            )
+            if cached:
+                gpu_block_ids.append(cached[0].block_id)
+            else:
+                break
+        return gpu_block_ids
+
+    def take_pending_evictions(self):
+        """Return and clear pending block evictions from the block pool."""
+        if not self.single_type_managers:
+            return []
+        return self.single_type_managers[0].block_pool.take_pending_evictions()
+
     def save_new_computed_blocks_with_session(
         self,
         request_id: str,
