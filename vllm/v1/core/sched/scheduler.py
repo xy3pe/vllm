@@ -265,19 +265,14 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            # TokenCake: skip STALLED_ON_FC requests (no tokens to schedule)
+            # TokenCake: STALLED_ON_FC requests with KV in HBM
+            # are not generating tokens but occupy blocks.
+            # (Offloaded requests are in the waiting queue, not here.)
             if request.status == RequestStatus.STALLED_ON_FC:
-                if request.offload_status in (OffloadStatus.OFFLOADED,
-                                               OffloadStatus.OFFLOADING):
-                    # KV not in HBM, doesn't count toward running capacity
-                    req_index += 1
-                    continue
-                else:
-                    # KV still in HBM but not generating tokens
-                    scheduled_running_reqs.append(request)
-                    num_scheduled_tokens[request.request_id] = 0
-                    req_index += 1
-                    continue
+                scheduled_running_reqs.append(request)
+                num_scheduled_tokens[request.request_id] = 0
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -461,6 +456,14 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
+
+                # TokenCake: skip requests still stalled on function call.
+                # They are in waiting queue because their KV was offloaded,
+                # but call_finish hasn't arrived yet.
+                if request.status == RequestStatus.STALLED_ON_FC:
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -1410,9 +1413,16 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
-            if request.status in (RequestStatus.RUNNING,
-                                  RequestStatus.STALLED_ON_FC):
+            if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
+            elif (request.status == RequestStatus.STALLED_ON_FC
+                  and request.offload_status == OffloadStatus.NONE):
+                # STALLED but KV still in HBM → in running list
+                running_requests_to_remove.add(request)
+            elif (request.status == RequestStatus.STALLED_ON_FC
+                  and request.offload_status != OffloadStatus.NONE):
+                # STALLED and offloaded → moved to waiting list
+                waiting_requests_to_remove.append(request)
             else:
                 waiting_requests_to_remove.append(request)
 
@@ -1683,17 +1693,65 @@ class Scheduler(SchedulerInterface):
             offload_decision = self.time_scheduler.should_offload(
                 request, num_blocks)
             if offload_decision:
-                request.offload_status = OffloadStatus.OFFLOADING
-                request.offload_start_time = time.monotonic()
-                # NOTE: Actual offload execution is deferred to Phase 2.
-                # For now, mark as OFFLOADED immediately (simulated).
-                request.offload_status = OffloadStatus.OFFLOADED
-                logger.info(
-                    "TokenCake: request %s offloaded (%d blocks, "
-                    "fc_type=%s, predict_time=%s)",
-                    request_id, num_blocks, fc_type, predict_time)
+                self._tokencake_offload_request(request, num_blocks)
 
         return {"success": True, "offload_decision": offload_decision}
+
+    def _tokencake_offload_request(
+        self, request: Request, num_blocks: int,
+    ) -> None:
+        """Offload a STALLED request's KV blocks to Host/CPU.
+
+        Strategy: push blocks to CPU via connector (if available),
+        then free GPU blocks and move request to waiting queue.
+        When re-scheduled, the connector auto-detects CPU cache
+        hits via get_num_new_matched_tokens() and loads them back
+        — avoiding full recomputation.
+        """
+        request.offload_status = OffloadStatus.OFFLOADING
+        request.offload_start_time = time.monotonic()
+
+        stored_blocks = 0
+        if self.connector is not None and hasattr(
+                self.connector, 'notify_release'):
+            # Push blocks to CPU/UCM via connector before freeing.
+            # The connector's OffloadingManager will store them and
+            # make them available for later loading.
+            try:
+                block_hashes = list(request.block_hashes)
+                block_ids_tuple = self.kv_cache_manager.get_block_ids(
+                    request.request_id)
+                gpu_block_ids = list(block_ids_tuple[0]) \
+                    if block_ids_tuple else []
+                if block_hashes and gpu_block_ids:
+                    stored_blocks = self.connector.notify_release(
+                        block_hashes, gpu_block_ids)
+            except Exception:
+                logger.warning(
+                    "TokenCake: failed to push blocks to connector "
+                    "for request %s, falling back to preempt",
+                    request.request_id, exc_info=True)
+
+        # Free GPU blocks and move to waiting (like preemption).
+        # num_computed_tokens is reset; the connector will restore
+        # tokens from CPU cache when the request is re-scheduled.
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        request.num_computed_tokens = 0
+
+        # Remove from running, add to waiting
+        if request in self.running:
+            self.running.remove(request)
+        request.status = RequestStatus.STALLED_ON_FC
+        request.offload_status = OffloadStatus.OFFLOADED
+        # Prepend to waiting so it's re-scheduled first on resume
+        self.waiting.prepend_request(request)
+
+        logger.info(
+            "TokenCake: request %s offloaded (%d blocks, "
+            "%d stored to connector, fc_type=%s, predict_time=%s)",
+            request.request_id, num_blocks, stored_blocks,
+            request.fc_type, request.fc_predict_time)
 
     def handle_call_finish(
         self,
@@ -1721,32 +1779,24 @@ class Scheduler(SchedulerInterface):
                 actual_duration=actual_duration,
             )
 
-        # Determine upload status and resume
+        # Resume the request based on offload status
         upload_status = "not_needed"
         if request.offload_status == OffloadStatus.NONE:
-            # KV never left HBM, resume directly
+            # KV never left HBM, resume directly from running
             request.status = RequestStatus.RUNNING
-        elif request.offload_status == OffloadStatus.UPLOAD_COMPLETE:
-            # Predictive upload already completed
-            request.status = RequestStatus.RUNNING
-            request.offload_status = OffloadStatus.NONE
-            upload_status = "completed"
-        elif request.offload_status == OffloadStatus.UPLOADING:
-            # Upload in progress, will resume when complete
-            upload_status = "in_progress"
         elif request.offload_status == OffloadStatus.OFFLOADED:
-            # KV in Host, need urgent upload
-            # NOTE: Phase 2 will implement actual upload.
-            # For now, resume directly (simulated).
-            request.status = RequestStatus.RUNNING
+            # KV offloaded to CPU. Request is in waiting queue.
+            # Transition to WAITING so scheduler will re-schedule it.
+            # The connector will detect CPU cache hit and load blocks
+            # back via get_num_new_matched_tokens() automatically.
+            request.status = RequestStatus.WAITING
             request.offload_status = OffloadStatus.NONE
-            upload_status = "completed"
-        elif request.offload_status == OffloadStatus.OFFLOADING:
-            # Offload still in progress but call already finished
-            # NOTE: Phase 2 will handle cancel/reverse.
-            request.status = RequestStatus.RUNNING
+            upload_status = "pending_reschedule"
+        else:
+            # OFFLOADING / UPLOADING / UPLOAD_COMPLETE edge cases
+            request.status = RequestStatus.WAITING
             request.offload_status = OffloadStatus.NONE
-            upload_status = "not_needed"
+            upload_status = "pending_reschedule"
 
         # Clear function call state
         request.fc_stall_start_time = None
@@ -1761,21 +1811,39 @@ class Scheduler(SchedulerInterface):
         return {"success": True, "upload_status": upload_status}
 
     def _check_predictive_uploads(self) -> None:
-        """Check if any STALLED+OFFLOADED requests need predictive upload."""
+        """Check if any STALLED+OFFLOADED requests need predictive upload.
+
+        For offloaded requests sitting in the waiting queue, trigger
+        early re-scheduling so the connector can start loading blocks
+        from CPU before call_finish arrives (zero-wait resume).
+        """
         if self.time_scheduler is None:
             return
 
-        stalled = [r for r in self.running
-                   if r.status == RequestStatus.STALLED_ON_FC]
+        # Check both running (STALLED+NONE in HBM) and waiting (STALLED+OFFLOADED)
+        stalled: list[Request] = []
+        for req in self.running:
+            if req.status == RequestStatus.STALLED_ON_FC:
+                stalled.append(req)
+        # Also check waiting queue for offloaded requests
+        for req in self.waiting:
+            if req.status == RequestStatus.STALLED_ON_FC:
+                stalled.append(req)
+
         if not stalled:
             return
 
         to_upload = self.time_scheduler.check_predictive_uploads(stalled)
         for req in to_upload:
-            # NOTE: Phase 2 will implement actual upload trigger.
-            # For now, mark as upload complete (simulated).
-            req.offload_status = OffloadStatus.UPLOAD_COMPLETE
-            req.upload_start_time = time.monotonic()
+            # For offloaded requests: transition to WAITING so they get
+            # re-scheduled. The connector will load blocks from CPU.
+            if req.offload_status == OffloadStatus.OFFLOADED:
+                req.status = RequestStatus.WAITING
+                req.offload_status = OffloadStatus.NONE
+                req.upload_start_time = time.monotonic()
+                logger.debug(
+                    "TokenCake: predictive upload triggered for %s",
+                    req.request_id)
 
     def _connector_finished(
         self, request: Request
