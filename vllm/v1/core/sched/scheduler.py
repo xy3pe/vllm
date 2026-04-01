@@ -48,7 +48,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import OffloadStatus, Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -213,6 +213,20 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # ---- TokenCake initialization ----
+        self.tokencake_enabled = self.scheduler_config.tokencake_enabled
+        self.time_scheduler = None
+        if self.tokencake_enabled:
+            from vllm.v1.core.sched.time_scheduler import (
+                TimeScheduler,
+                TimeSchedulerConfig,
+            )
+            ts_config = TimeSchedulerConfig(
+                offload_enabled=self.scheduler_config.tokencake_offload_enabled,
+            )
+            self.time_scheduler = TimeScheduler(ts_config)
+            logger.info("TokenCake enabled: TimeScheduler initialized")
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -242,10 +256,28 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # ---- TokenCake: check predictive uploads ----
+        if self.tokencake_enabled and self.time_scheduler is not None:
+            self._check_predictive_uploads()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # TokenCake: skip STALLED_ON_FC requests (no tokens to schedule)
+            if request.status == RequestStatus.STALLED_ON_FC:
+                if request.offload_status in (OffloadStatus.OFFLOADED,
+                                               OffloadStatus.OFFLOADING):
+                    # KV not in HBM, doesn't count toward running capacity
+                    req_index += 1
+                    continue
+                else:
+                    # KV still in HBM but not generating tokens
+                    scheduled_running_reqs.append(request)
+                    num_scheduled_tokens[request.request_id] = 0
+                    req_index += 1
+                    continue
 
             if (
                 request.num_output_placeholders > 0
@@ -1378,7 +1410,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
-            if request.status == RequestStatus.RUNNING:
+            if request.status in (RequestStatus.RUNNING,
+                                  RequestStatus.STALLED_ON_FC):
                 running_requests_to_remove.add(request)
             else:
                 waiting_requests_to_remove.append(request)
@@ -1593,6 +1626,156 @@ class Scheduler(SchedulerInterface):
 
     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
         return self.connector
+
+    ########################################################################
+    # TokenCake Agent Event Handlers
+    ########################################################################
+
+    def handle_agent_meta(
+        self,
+        request_id: str,
+        agent_type: str,
+        static_priority: float,
+    ) -> dict:
+        """Register agent metadata for a request."""
+        if not self.tokencake_enabled:
+            return {"success": True, "message": "tokencake not enabled"}
+
+        request = self.requests.get(request_id)
+        if request is None:
+            return {"success": False,
+                    "message": f"request {request_id} not found"}
+
+        request.agent_type = agent_type
+        request.static_priority = static_priority
+        return {"success": True}
+
+    def handle_call_start(
+        self,
+        request_id: str,
+        fc_type: str,
+        predict_time: float | None,
+    ) -> dict:
+        """Handle function call start: transition to STALLED_ON_FC."""
+        if not self.tokencake_enabled:
+            return {"success": True, "message": "tokencake not enabled"}
+
+        request = self.requests.get(request_id)
+        if request is None:
+            return {"success": False,
+                    "message": f"request {request_id} not found"}
+        if request.status != RequestStatus.RUNNING:
+            return {"success": False,
+                    "message": f"request {request_id} not RUNNING "
+                               f"(status={request.status})"}
+
+        # Transition to STALLED_ON_FC
+        request.status = RequestStatus.STALLED_ON_FC
+        request.fc_stall_start_time = time.monotonic()
+        request.fc_type = fc_type
+        request.fc_predict_time = predict_time
+        request.fc_num_stalls += 1
+
+        # Time Scheduler offload decision
+        offload_decision = False
+        if self.time_scheduler is not None:
+            num_blocks = self.kv_cache_manager.get_num_blocks(request)
+            offload_decision = self.time_scheduler.should_offload(
+                request, num_blocks)
+            if offload_decision:
+                request.offload_status = OffloadStatus.OFFLOADING
+                request.offload_start_time = time.monotonic()
+                # NOTE: Actual offload execution is deferred to Phase 2.
+                # For now, mark as OFFLOADED immediately (simulated).
+                request.offload_status = OffloadStatus.OFFLOADED
+                logger.info(
+                    "TokenCake: request %s offloaded (%d blocks, "
+                    "fc_type=%s, predict_time=%s)",
+                    request_id, num_blocks, fc_type, predict_time)
+
+        return {"success": True, "offload_decision": offload_decision}
+
+    def handle_call_finish(
+        self,
+        request_id: str,
+        actual_duration: float,
+        error: bool,
+    ) -> dict:
+        """Handle function call finish: resume inference."""
+        if not self.tokencake_enabled:
+            return {"success": True, "message": "tokencake not enabled"}
+
+        request = self.requests.get(request_id)
+        if request is None:
+            return {"success": False,
+                    "message": f"request {request_id} not found"}
+        if request.status != RequestStatus.STALLED_ON_FC:
+            return {"success": False,
+                    "message": f"request {request_id} not STALLED_ON_FC "
+                               f"(status={request.status})"}
+
+        # Update EWMA prediction model
+        if self.time_scheduler is not None:
+            self.time_scheduler.update_prediction(
+                fc_type=request.fc_type,
+                actual_duration=actual_duration,
+            )
+
+        # Determine upload status and resume
+        upload_status = "not_needed"
+        if request.offload_status == OffloadStatus.NONE:
+            # KV never left HBM, resume directly
+            request.status = RequestStatus.RUNNING
+        elif request.offload_status == OffloadStatus.UPLOAD_COMPLETE:
+            # Predictive upload already completed
+            request.status = RequestStatus.RUNNING
+            request.offload_status = OffloadStatus.NONE
+            upload_status = "completed"
+        elif request.offload_status == OffloadStatus.UPLOADING:
+            # Upload in progress, will resume when complete
+            upload_status = "in_progress"
+        elif request.offload_status == OffloadStatus.OFFLOADED:
+            # KV in Host, need urgent upload
+            # NOTE: Phase 2 will implement actual upload.
+            # For now, resume directly (simulated).
+            request.status = RequestStatus.RUNNING
+            request.offload_status = OffloadStatus.NONE
+            upload_status = "completed"
+        elif request.offload_status == OffloadStatus.OFFLOADING:
+            # Offload still in progress but call already finished
+            # NOTE: Phase 2 will handle cancel/reverse.
+            request.status = RequestStatus.RUNNING
+            request.offload_status = OffloadStatus.NONE
+            upload_status = "not_needed"
+
+        # Clear function call state
+        request.fc_stall_start_time = None
+        request.fc_type = None
+        request.fc_predict_time = None
+
+        logger.info(
+            "TokenCake: request %s resumed (actual_duration=%.2fs, "
+            "upload_status=%s)",
+            request_id, actual_duration, upload_status)
+
+        return {"success": True, "upload_status": upload_status}
+
+    def _check_predictive_uploads(self) -> None:
+        """Check if any STALLED+OFFLOADED requests need predictive upload."""
+        if self.time_scheduler is None:
+            return
+
+        stalled = [r for r in self.running
+                   if r.status == RequestStatus.STALLED_ON_FC]
+        if not stalled:
+            return
+
+        to_upload = self.time_scheduler.check_predictive_uploads(stalled)
+        for req in to_upload:
+            # NOTE: Phase 2 will implement actual upload trigger.
+            # For now, mark as upload complete (simulated).
+            req.offload_status = OffloadStatus.UPLOAD_COMPLETE
+            req.upload_start_time = time.monotonic()
 
     def _connector_finished(
         self, request: Request

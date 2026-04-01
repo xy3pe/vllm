@@ -367,6 +367,44 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    # ---- TokenCake Agent API Methods ----
+
+    def agent_meta(
+        self,
+        request_id: str,
+        agent_type: str,
+        static_priority: float,
+    ) -> dict:
+        """Register agent metadata for a request."""
+        if hasattr(self.scheduler, 'handle_agent_meta'):
+            return self.scheduler.handle_agent_meta(
+                request_id, agent_type, static_priority)
+        return {"success": True, "message": "tokencake not enabled"}
+
+    def agent_call_start(
+        self,
+        request_id: str,
+        fc_type: str,
+        predict_time: float | None,
+    ) -> dict:
+        """Notify that a request has entered function call phase."""
+        if hasattr(self.scheduler, 'handle_call_start'):
+            return self.scheduler.handle_call_start(
+                request_id, fc_type, predict_time)
+        return {"success": True, "message": "tokencake not enabled"}
+
+    def agent_call_finish(
+        self,
+        request_id: str,
+        actual_duration: float,
+        error: bool,
+    ) -> dict:
+        """Notify that a function call has completed."""
+        if hasattr(self.scheduler, 'handle_call_finish'):
+            return self.scheduler.handle_call_finish(
+                request_id, actual_duration, error)
+        return {"success": True, "message": "tokencake not enabled"}
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""

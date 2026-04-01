@@ -426,6 +426,15 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def get_num_blocks(self, request: Request) -> int:
+        """Get the total number of KV cache blocks for a request."""
+        try:
+            blocks = self.coordinator.get_blocks(request.request_id)
+            # blocks is a tuple of lists (one per kv_cache_group)
+            return sum(len(group) for group in blocks)
+        except (KeyError, AttributeError):
+            return 0
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:

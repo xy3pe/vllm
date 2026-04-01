@@ -137,6 +137,21 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # ---- TokenCake extension fields ----
+        self.agent_type: str | None = None
+        self.static_priority: float = 0.0
+
+        # Function call state
+        self.fc_stall_start_time: float | None = None
+        self.fc_type: str | None = None
+        self.fc_predict_time: float | None = None
+        self.fc_num_stalls: int = 0
+
+        # Offload state
+        self.offload_status: OffloadStatus = OffloadStatus.NONE
+        self.offload_start_time: float | None = None
+        self.upload_start_time: float | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -246,6 +261,15 @@ class Request:
         return id(self) < id(other)
 
 
+class OffloadStatus(enum.IntEnum):
+    """KV Cache offload status for TokenCake."""
+    NONE = 0           # Not offloaded, KV in HBM
+    OFFLOADING = 1     # HBM → Host transfer in progress
+    OFFLOADED = 2      # KV in Host RAM (or UCM Store)
+    UPLOADING = 3      # Host → HBM transfer in progress (predictive upload)
+    UPLOAD_COMPLETE = 4  # Upload done, waiting to resume scheduling
+
+
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
 
@@ -253,6 +277,7 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_FSM = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
     RUNNING = enum.auto()
+    STALLED_ON_FC = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.

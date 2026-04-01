@@ -46,6 +46,12 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.protocol import (
+    AgentMetaRequest,
+    AgentMetaResponse,
+    CallFinishRequest,
+    CallFinishResponse,
+    CallStartRequest,
+    CallStartResponse,
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionRequest,
@@ -676,6 +682,77 @@ async def create_translations(
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+# ==================== TokenCake Agent API ====================
+
+
+@router.post("/v1/agent/meta")
+async def agent_meta(request: AgentMetaRequest, raw_request: Request):
+    """Register agent metadata for Space Scheduler priority."""
+    client = engine_client(raw_request)
+    try:
+        result = client.call_utility(
+            "agent_meta",
+            request.request_id,
+            request.agent_type,
+            request.static_priority,
+        )
+        return JSONResponse(content=AgentMetaResponse(
+            success=result.get("success", True),
+            message=result.get("message", ""),
+        ).model_dump())
+    except Exception as e:
+        return JSONResponse(content=AgentMetaResponse(
+            success=False,
+            message=str(e),
+        ).model_dump())
+
+
+@router.post("/v1/agent/call_start")
+async def call_start(request: CallStartRequest, raw_request: Request):
+    """Notify engine that a request has entered function call phase."""
+    client = engine_client(raw_request)
+    try:
+        result = client.call_utility(
+            "agent_call_start",
+            request.request_id,
+            request.fc_type,
+            request.predict_time,
+        )
+        return JSONResponse(content=CallStartResponse(
+            success=result.get("success", True),
+            offload_decision=result.get("offload_decision", False),
+            message=result.get("message", ""),
+        ).model_dump())
+    except Exception as e:
+        return JSONResponse(content=CallStartResponse(
+            success=False,
+            message=str(e),
+        ).model_dump())
+
+
+@router.post("/v1/agent/call_finish")
+async def call_finish(request: CallFinishRequest, raw_request: Request):
+    """Notify engine that function call has completed, resume inference."""
+    client = engine_client(raw_request)
+    try:
+        result = client.call_utility(
+            "agent_call_finish",
+            request.request_id,
+            request.actual_duration,
+            request.error,
+        )
+        return JSONResponse(content=CallFinishResponse(
+            success=result.get("success", True),
+            upload_status=result.get("upload_status", "not_needed"),
+            message=result.get("message", ""),
+        ).model_dump())
+    except Exception as e:
+        return JSONResponse(content=CallFinishResponse(
+            success=False,
+            message=str(e),
+        ).model_dump())
 
 
 if envs.VLLM_SERVER_DEV_MODE:

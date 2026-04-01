@@ -131,6 +131,50 @@ class ErrorResponse(OpenAIBaseModel):
     error: ErrorInfo
 
 
+# ==================== TokenCake Agent API Models ====================
+
+
+class AgentMetaRequest(OpenAIBaseModel):
+    """Register agent metadata for Space Scheduler priority."""
+    request_id: str
+    agent_type: str
+    static_priority: float = 0.0
+
+
+class AgentMetaResponse(OpenAIBaseModel):
+    success: bool
+    message: str = ""
+
+
+class CallStartRequest(OpenAIBaseModel):
+    """Notify vLLM that a request has entered function call phase."""
+    request_id: str
+    fc_type: str
+    predict_time: float | None = None
+    num_stages: int = 1
+    stage_name: str | None = None
+
+
+class CallStartResponse(OpenAIBaseModel):
+    success: bool
+    offload_decision: bool = False
+    message: str = ""
+
+
+class CallFinishRequest(OpenAIBaseModel):
+    """Notify vLLM that function call has completed, resume inference."""
+    request_id: str
+    actual_duration: float
+    stage_name: str | None = None
+    error: bool = False
+
+
+class CallFinishResponse(OpenAIBaseModel):
+    success: bool
+    upload_status: str = "not_needed"
+    message: str = ""
+
+
 class ModelPermission(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"modelperm-{random_uuid()}")
     object: str = "model_permission"

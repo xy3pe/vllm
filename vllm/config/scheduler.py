@@ -138,10 +138,19 @@ class SchedulerConfig:
     """
 
     stream_interval: int = Field(default=1, ge=1)
-    """The interval (or buffer size) for streaming in terms of token length.
-    A smaller value (1) makes streaming smoother by sending each token immediately,
-    while a larger value (e.g., 10) reduces host overhead and may increase throughput
-    by batching multiple tokens before sending."""
+    """The interval (or buffer size) for streaming in terms of token length."""
+
+    # ---- TokenCake Configuration ----
+    tokencake_enabled: bool = False
+    """Master switch for TokenCake agent-aware scheduling.
+    When False, agent API endpoints accept calls silently but perform
+    no scheduling actions."""
+
+    tokencake_offload_enabled: bool = True
+    """Enable Time Scheduler KV cache offload during function calls."""
+
+    tokencake_priority_enabled: bool = True
+    """Enable Space Scheduler hybrid priority and memory partitioning."""
 
     @staticmethod
     def default_factory(**kwargs):
