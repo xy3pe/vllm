@@ -564,6 +564,10 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    tokencake_enabled: bool = SchedulerConfig.tokencake_enabled
+    tokencake_offload_enabled: bool = SchedulerConfig.tokencake_offload_enabled
+    tokencake_priority_enabled: bool = SchedulerConfig.tokencake_priority_enabled
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
 
@@ -1095,6 +1099,18 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--tokencake-enabled",
+            **scheduler_kwargs["tokencake_enabled"],
+        )
+        scheduler_group.add_argument(
+            "--tokencake-offload-enabled",
+            **scheduler_kwargs["tokencake_offload_enabled"],
+        )
+        scheduler_group.add_argument(
+            "--tokencake-priority-enabled",
+            **scheduler_kwargs["tokencake_priority_enabled"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1600,6 +1616,9 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            tokencake_enabled=self.tokencake_enabled,
+            tokencake_offload_enabled=self.tokencake_offload_enabled,
+            tokencake_priority_enabled=self.tokencake_priority_enabled,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
